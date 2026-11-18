@@ -1,5 +1,7 @@
 import spatialproteomics as sp
 from skimage.io import imread
+from skimage.measure import label as label_connected_components
+from skimage.segmentation import relabel_sequential
 import numpy as np
 import tifffile
 import matplotlib.pyplot as plt
@@ -32,9 +34,9 @@ def ReadConfFile(FilePath):
     channel_segment = data['channel_for_segmentation']
     list_of_channels = data['list_of_channels']
     list_of_markers = data['list_of_markers']
-    label_expansion = data['segmentation_label_expansion']
-    min_area = data['min_area']
-    max_area = data['max_area']
+    label_expansion = _optional_number(data['segmentation_label_expansion'], 'segmentation_label_expansion')
+    min_area = _optional_number(data['min_area'], 'min_area')
+    max_area = _optional_number(data['max_area'], 'max_area')
     save_intermediate_plots = data['save_intermediate_plots']
     N_intermediate_plots = data['number_intermediate_plots']
     S_intermediate_plots = data['size_intermediate_plots']
@@ -62,13 +64,23 @@ def ReadConfFile(FilePath):
     if stardist_scale <= 0:
         raise ValueError("stardist_scale must be greater than 0.")
     save_omero_segmentation_csv = bool(data.get('save_omero_segmentation_csv', False))
-    return (image_path, crop_x, crop_y, channel_segment, list_of_channels, list_of_markers, 
-            label_expansion, min_area, max_area, save_intermediate_plots, N_intermediate_plots, 
-            S_intermediate_plots, save_binary_plots, threshold_binary, output_dir, 
-            list_of_genes_intermediate_plots, normalise_intensity, save_intermediate_zarr, 
+    # Optional pre-computed label mask. When set, StarDist is skipped.
+    segmentation_mask_path = data.get('segmentation_mask_path', None)
+    if segmentation_mask_path is False or (
+        isinstance(segmentation_mask_path, str)
+        and segmentation_mask_path.strip().lower() in {"", "none", "null", "false"}
+    ):
+        segmentation_mask_path = None
+    segmentation_mask_type = str(data.get('segmentation_mask_type', 'nuclei')).strip().lower()
+    if segmentation_mask_type not in {'nuclei', 'whole_cell'}:
+        raise ValueError("segmentation_mask_type must be 'nuclei' or 'whole_cell'.")
+    return (image_path, crop_x, crop_y, channel_segment, list_of_channels, list_of_markers,
+            label_expansion, min_area, max_area, save_intermediate_plots, N_intermediate_plots,
+            S_intermediate_plots, save_binary_plots, threshold_binary, output_dir,
+            list_of_genes_intermediate_plots, normalise_intensity, save_intermediate_zarr,
             list_output_formats, pixelsize, manual_marker_thresholds, split_signal_nuclei_cytoplasm,
             intensity_quantiles, positive_cell_rules, stardist_scale,
-            save_omero_segmentation_csv)
+            save_omero_segmentation_csv, segmentation_mask_path, segmentation_mask_type)
 
 
 def normalize_intensities(sp_object):
@@ -80,6 +92,20 @@ def normalize_intensities(sp_object):
     sp_object = sp_object.assign(_intensity_raw=sp_object["_intensity"])
     sp_object = sp_object.assign(_intensity=X_norm)
     return sp_object
+
+
+def _optional_number(value, name):
+    """None / null / 'None' / '' / False -> None; otherwise a float."""
+    if value is None or value is False:
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() in {"", "none", "null", "false"}:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f"{name} must be a number or null; got {value!r}.")
+    return float(value)
 
 
 def _optional_mapping(value, name):
@@ -471,7 +497,63 @@ def add_analysis_results_to_anndata(
     adata.uns["akoya_positive_cell_rules"] = positivity_metadata
 
 
-def read_crop_cyx(path, crop_x, crop_y):
+def _crop_yx(arr, crop_x, crop_y):
+    """Crop the last two (Y, X) axes with the same rules as the image crop."""
+    if crop_x or crop_y:
+        if isinstance(crop_x, str):
+            crop_x = [0, arr.shape[-1]]
+        if isinstance(crop_y, str):
+            crop_y = [0, arr.shape[-2]]
+        return arr[..., crop_y[0]:crop_y[1], crop_x[0]:crop_x[1]]
+    return arr
+
+
+def read_segmentation_mask(path, crop_x, crop_y, full_yx_shape):
+    """
+    Read a pre-computed label mask (tif/ome.tif/npy/png), check it has the same
+    XY size as the ORIGINAL (uncropped) image, apply the same crop as the image,
+    and return a sequentially relabelled int32 label image (0 = background).
+
+    A binary mask (only 0/1 or bool) is turned into labels by connected
+    components; touching cells will then merge, so a proper label mask is preferred.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        mask = np.load(path)
+    elif suffix in {".tif", ".tiff"}:
+        mask = tifffile.imread(path)
+    else:
+        mask = imread(path)
+    mask = np.squeeze(np.asarray(mask))
+
+    if mask.ndim != 2:
+        raise ValueError(f"Segmentation mask must be 2D (YX); got shape {mask.shape}.")
+    if mask.shape != tuple(full_yx_shape):
+        raise ValueError(
+            f"Segmentation mask shape {mask.shape} does not match the original image YX shape "
+            f"{tuple(full_yx_shape)}."
+        )
+    if np.issubdtype(mask.dtype, np.floating):
+        if not np.all(np.mod(mask, 1) == 0):
+            raise ValueError("Segmentation mask contains non-integer values; expected a label image.")
+    if mask.min() < 0:
+        raise ValueError("Segmentation mask contains negative labels.")
+
+    mask = _crop_yx(mask, crop_x, crop_y)
+
+    if mask.dtype == bool or mask.max() <= 1:
+        print("WARNING: segmentation mask looks binary; labelling connected components "
+              "(touching cells will be merged).")
+        mask = label_connected_components(mask > 0, connectivity=1)
+
+    # Make labels 1..N so they fit int32 and find_objects() stays small.
+    mask, _, _ = relabel_sequential(mask.astype(np.int64, copy=False))
+    print(f"Imported segmentation mask: {int(mask.max())} objects, shape {mask.shape}")
+    return mask.astype(np.int32, copy=False)
+
+
+def read_crop_cyx(path, crop_x, crop_y, return_full_yx_shape=False):
     """
     Read tif/qptiff/nd2, try to determine axes, return cropped image in CYX order.
 
@@ -497,18 +579,31 @@ def read_crop_cyx(path, crop_x, crop_y):
     # --- determine axes + put into CYX ---
     if axes is not None:
         axes = axes.upper()
+        print(f"Image axes from metadata: {axes}, shape: {arr.shape}")
+
+        # Drop length-1 axes (e.g. T=1, Z=1 in TZCYX) but always keep Y and X.
+        keep = [i for i, (a, n) in enumerate(zip(axes, arr.shape)) if n > 1 or a in "YX"]
+        arr = arr.reshape([arr.shape[i] for i in keep])
+        axes = "".join(axes[i] for i in keep)
+
+        if "Y" not in axes or "X" not in axes:
+            raise ValueError(f"Image metadata has no Y/X axes: {axes} (shape {arr.shape}).")
 
         if axes == "YX":
             arr = arr[np.newaxis, ...]  # -> CYX (C=1)
 
-        elif set(axes) == set("CYX") and len(axes) == 3:
-            # reorder to CYX
-            arr = np.transpose(arr, [axes.index("C"), axes.index("Y"), axes.index("X")])
+        elif len(axes) == 3:
+            # One non-spatial axis left. tifffile often labels a channel stack as
+            # Q (unknown), I (image sequence), Z or S instead of C -> treat it as channels.
+            other = next(a for a in axes if a not in "YX")
+            if other != "C":
+                print(f"WARNING: treating axis '{other}' (size {arr.shape[axes.index(other)]}) as channels.")
+            arr = np.transpose(arr, [axes.index(other), axes.index("Y"), axes.index("X")])
 
         else:
             raise ValueError(
-                f"Unsupported axes from metadata: {axes} "
-                f"(only YX, CYX, YXC supported)."
+                f"Unsupported axes from metadata after dropping singleton axes: {axes} "
+                f"(shape {arr.shape}). Expected YX or one extra (channel) axis."
             )
 
     else:
@@ -530,16 +625,12 @@ def read_crop_cyx(path, crop_x, crop_y):
             )
 
     # --- crop in XY (on CYX array) ---
-    if crop_x or crop_y:
-        if isinstance(crop_x, str):
-            crop_x = [0, arr.shape[2]]
-        if isinstance(crop_y, str):
-            crop_y = [0, arr.shape[1]]
-        cropped = arr[:, crop_y[0]:crop_y[1], crop_x[0]:crop_x[1]]
-    else:
-        cropped = arr
+    full_yx_shape = arr.shape[1:]
+    cropped = _crop_yx(arr, crop_x, crop_y)
 
     del arr
+    if return_full_yx_shape:
+        return cropped, full_yx_shape
     return cropped
 
 
@@ -876,13 +967,19 @@ def main(ConfFilePath):
     output_dir, list_of_genes_intermediate_plots, normalise_intensity, save_intermediate_zarr, 
     list_output_formats, pixelsize, manual_marker_thresholds, split_signal_nuclei_cytoplasm,
     intensity_quantiles, positive_cell_rules, stardist_scale,
-    save_omero_segmentation_csv) = ReadConfFile(ConfFilePath)
+    save_omero_segmentation_csv, segmentation_mask_path, segmentation_mask_type) = ReadConfFile(ConfFilePath)
+
+    mask_is_whole_cell = bool(segmentation_mask_path) and segmentation_mask_type == "whole_cell"
+    if mask_is_whole_cell and split_signal_nuclei_cytoplasm:
+        print("WARNING: imported whole-cell mask has no nuclei information; "
+              "disabling split_signal_nuclei_cytoplasm.")
+        split_signal_nuclei_cytoplasm = False
 
     print('Output dir' + str(output_dir))
     path_zarr = os.path.join(output_dir,"sp_object.zarr")
-    
+
     print('Reading the image')
-    img = read_crop_cyx(image_path, crop_x, crop_y)
+    img, full_yx_shape = read_crop_cyx(image_path, crop_x, crop_y, return_full_yx_shape=True)
     image_size = img[0].shape
     print(image_size)
     sp_object = sp.load_image_data(img, channel_coords=list_of_channels)
@@ -912,11 +1009,20 @@ def main(ConfFilePath):
     gc.collect()
 
     print("Segmentation and area filtering")
-    print(f"Using StarDist scale={stardist_scale}")
-    sp_object = sp_object.tl.stardist(channel=channel_segment, scale=stardist_scale)
+    if segmentation_mask_path:
+        print(f"Skipping StarDist; importing {segmentation_mask_type} mask from {segmentation_mask_path}")
+        mask = read_segmentation_mask(segmentation_mask_path, crop_x, crop_y, full_yx_shape)
+        # Same layer/obs StarDist would create: '_segmentation', cells coord, centroids.
+        sp_object = sp_object.pp.add_segmentation(mask, reindex=False, add_obs=True)
+        del mask
+    else:
+        print(f"Using StarDist scale={stardist_scale}")
+        sp_object = sp_object.tl.stardist(channel=channel_segment, scale=stardist_scale)
     nuclei_segmentation = sp_object["_segmentation"].values.copy() if split_signal_nuclei_cytoplasm else None
-    if label_expansion:
-        sp_object = sp_object.pp.expand_segmentation(radius = label_expansion)
+    if label_expansion and mask_is_whole_cell:
+        print("Imported mask is whole-cell; skipping segmentation_label_expansion.")
+    elif label_expansion:
+        sp_object = sp_object.pp.expand_segmentation(radius = int(label_expansion))
     sp_object = sp_object.pp.add_observations("area")
     plot_save_area_hist(sp_object, output_dir)
     if min_area: 
