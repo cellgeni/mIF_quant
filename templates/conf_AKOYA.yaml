@@ -1,6 +1,10 @@
 image_path: /lustre/scratch127/cellgen/cellgeni/tickets/tic-4640/data/AkoyaPhenocycler/xenium_aligned_palom/BK22-SKI-27-FO-1-S57-D2_moving_reg.ome.tif
 crop_x: None
 crop_y: None
+
+## Use segmentation_mask_path for importing external segmentaiton mask image - in this case all segemntation part with expansion part will be ignored
+# segmentation_mask_path: "/lustre/scratch127/cellgen/cellgeni/tickets/REQ-79885/cellpose_output/test_run_1/pv_smooth_cp_masks.tif"
+
 channel_for_segmentation: DAPI
 list_of_channels: [
                   "DAPI", "Keratin 14", "CD107", "CD4", "CD31", "SMA", "CD68", "CD44",
