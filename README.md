@@ -1,6 +1,6 @@
 # Introduction
 
-AKOYA pipeline automates low-level spatial proteomics processing from a multichannel image: preprocessing, segmentation, per-cell intensity extraction, and positive/negative marker calls. It is built mostly using [spatialproteomics_cellgeni](https://github.com/cellgeni/spatialproteomics), which was adapted for large images (original package: [spatialproteomics](https://github.com/sagar87/spatialproteomics)). Outputs can include (i) a spatialproteomics object in Zarr format; (ii) CSV tables containing cell positions, per-cell intensity summaries, and marker-presence calls; and (iii) an AnnData file. `adata.X` remains the transformed mean-intensity matrix for backwards compatibility, while the additional per-cell statistics are stored in `adata.obs`. See [Output structure](#output-structure) for a description of every output file and **open_output_files.ipynb** for examples of how to open them.
+AKOYA pipeline automates low-level spatial proteomics processing from a multichannel image: preprocessing, segmentation (StarDist, or an imported pre-computed mask - see [Imported segmentation mask](#imported-segmentation-mask-optional)), per-cell intensity extraction, and positive/negative marker calls. It is built mostly using [spatialproteomics_cellgeni](https://github.com/cellgeni/spatialproteomics), which was adapted for large images (original package: [spatialproteomics](https://github.com/sagar87/spatialproteomics)). Outputs can include (i) a spatialproteomics object in Zarr format; (ii) CSV tables containing cell positions, per-cell intensity summaries, and marker-presence calls; and (iii) an AnnData file. `adata.X` remains the transformed mean-intensity matrix for backwards compatibility, while the additional per-cell statistics are stored in `adata.obs`. See [Output structure](#output-structure) for a description of every output file and **open_output_files.ipynb** for examples of how to open them.
 
 # Environment
 
@@ -18,7 +18,7 @@ All parameters used in pipeline together with input/output paths should be speci
 
 `list_of_channels (list[str])` - Channel names in the same order as the channel axis of the loaded image
 
-`channel_for_segmentation (str)` - Which channel to use for StarDist segmentation. Typically the DAPI channel name
+`channel_for_segmentation (str)` - Which channel to use for StarDist segmentation. Typically the DAPI channel name. Ignored when `segmentation_mask_path` is set (the key must still be present in the config).
 
 `list_of_markers (list[str])` - Marker channels used to compute % positive pixels and generate binary labels / cell-type-like labels via thresholding.
 
@@ -28,15 +28,45 @@ All parameters used in pipeline together with input/output paths should be speci
 
 `crop_y (list[int, int])` - Y-range to crop as [y_start, y_end].
 
+Use `null` for both to process the whole image. If `segmentation_mask_path` is set, the same crop is applied to the mask.
+
 ### Segmentation + filtering
 
 `segmentation_label_expansion (int or falsy)` - If truthy, expands segmentation labels by this radius (pixels) using expand_segmentation
 
-`stardist_scale (float, optional)` - Image scale passed to StarDist (default: `3`, preserving the original pipeline behaviour). For cells that are split into multiple objects, try a smaller value such as `1`, `0.75`, or `0.5`; this reduces the apparent cell size seen by the model. This option changes segmentation itself, whereas `segmentation_label_expansion` only expands masks after segmentation.
+`stardist_scale (float, optional)` - Image scale passed to StarDist (default: `3`, preserving the original pipeline behaviour). For cells that are split into multiple objects, try a smaller value such as `1`, `0.75`, or `0.5`; this reduces the apparent cell size seen by the model. This option changes segmentation itself, whereas `segmentation_label_expansion` only expands masks after segmentation. Ignored when `segmentation_mask_path` is set.
 
 `min_area (int or falsy)` - If truthy, filters out segmented objects with area <= min_area.
 
 `max_area (int or falsy)` - If truthy, filters out segmented objects with area >= max_area.
+
+`null`, `None`, an empty value or `False` all disable `min_area` / `max_area` / `segmentation_label_expansion`. The area filters are also applied to an imported mask, so set them to `null` if the mask is already final.
+
+### Imported segmentation mask (optional)
+
+Instead of running StarDist, you can provide your own segmentation (e.g. from Cellpose, QuPath, Mesmer, or a manually curated mask). When `segmentation_mask_path` is set, the StarDist step is skipped and the mask is added to the spatialproteomics object as its `_segmentation` layer (with cell IDs and centroids), so every later step - label expansion, area filtering, intensity statistics, positive/negative calls, plots and all outputs - runs exactly as with StarDist.
+
+`segmentation_mask_path (str or null, optional)` - Path to a label image: `0` = background, `1..N` = one integer ID per cell. Supported formats: `.tif` / `.tiff` / `.ome.tif`, `.npy`, `.png`. Default `null` (use StarDist).
+
+`segmentation_mask_type (str, optional)` - How the imported mask is interpreted. Default `nuclei`.
+- `nuclei` - the mask is treated like StarDist output: `segmentation_label_expansion` is applied to grow nuclei into cells, and `split_signal_nuclei_cytoplasm` works as usual.
+- `whole_cell` - the mask is used as the final cell outlines: `segmentation_label_expansion` is skipped and `split_signal_nuclei_cytoplasm` is switched off (a warning is printed), because a whole-cell mask carries no nucleus information.
+
+Requirements and behaviour:
+- The mask must be 2D and have **the same Y/X size as the original (uncropped) image**; otherwise the pipeline stops with an error. `crop_x` / `crop_y` are then applied to the mask in the same way as to the image.
+- Labels must be non-negative integers. They are renumbered to `1..N` internally, so cell IDs in the outputs may differ from the IDs in your mask file.
+- A binary mask (only 0/1) is accepted and converted to labels by connected components, but touching cells will be merged into one object - a proper label mask is preferred.
+- The log prints `Skipping StarDist; importing <type> mask from <path>` and `Imported segmentation mask: N objects`, which you can use to confirm the mask was used.
+
+Example (Cellpose whole-cell mask, no area filtering):
+
+```
+segmentation_mask_path: "/path/to/cellpose_output/image_cp_masks.tif"
+segmentation_mask_type: whole_cell
+segmentation_label_expansion: 0
+min_area: null
+max_area: null
+```
 
 ### Intermediate plots
 
@@ -58,7 +88,7 @@ Marker-vs-celltype plots saved by `save_individual_marker_presence_plots` includ
 
 `manual_marker_thresholds (dict[str, float], optional)` - Per-channel overrides for image preprocessing thresholds, for example `{CD8: 1200, "PD-L1": 0.995}`. Channels not listed here keep the automatic Otsu threshold. Values below 1 are interpreted as relative channel quantiles; values greater than or equal to 1 are interpreted as absolute intensity thresholds.
 
-`split_signal_nuclei_cytoplasm (bool, optional)` - If True, also quantifies nuclei and, when `segmentation_label_expansion` is set, cytoplasm. `whole_cell` means the expanded/combined cell mask (nucleus plus cytoplasm). Whole-cell mean intensity remains in `adata.X`; backwards-compatible transformed compartment means are written to `adata.layers["nuclei_intensity"]` and `adata.layers["cytoplasm_intensity"]`.
+`split_signal_nuclei_cytoplasm (bool, optional)` - If True, also quantifies nuclei and, when `segmentation_label_expansion` is set, cytoplasm. `whole_cell` means the expanded/combined cell mask (nucleus plus cytoplasm). Whole-cell mean intensity remains in `adata.X`; backwards-compatible transformed compartment means are written to `adata.layers["nuclei_intensity"]` and `adata.layers["cytoplasm_intensity"]`. Not available with an imported mask of `segmentation_mask_type: whole_cell`.
 
 ### Per-cell intensity statistics
 
